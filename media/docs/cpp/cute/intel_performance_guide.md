@@ -103,13 +103,19 @@ Common tile sizes in this codebase:
 - Reduce M or N if register spill is observed (check with [Intel VTune](https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler.html), [PTI for GPU](https://github.com/intel/pti-gpu), or compiler `-v` output).
 - Increase K-depth for memory-bound kernels to amortize the 2D block load overhead.
 
-#### Real-world example: Flash Attention BF16 tile-size tuning on Intel Xe BMG
+#### Exploratory example: Flash Attention BF16 tile-size tuning on Intel Xe BMG
 
-An improvement to the BF16 Flash Attention prefill kernel on Intel Arc BMG demonstrated that
-doubling the K-tile in the QK GEMM stage meaningfully improves performance by amortizing 2D block
+> ⚠️ **Not validated with benchmarks.** The tile-size suggestion below is an architecturally
+> plausible tuning direction but has **not** been confirmed with measured performance data.
+> Always profile with [Intel VTune](https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler.html)
+> or [PTI for GPU](https://github.com/intel/pti-gpu) on your specific workload before adopting
+> any tile-size change.
+
+An analysis of the BF16 Flash Attention prefill kernel on Intel Arc BMG suggests that
+doubling the K-tile in the QK GEMM stage *may* improve performance by amortizing 2D block
 load overhead over more XMX compute.
 
-**Before** (conservative K-tile = 32):
+**Current codebase default** (K-tile = 32, matches actual configurations above):
 
 ```cpp
 // HEAD_DIM = 64 or 128
@@ -118,7 +124,20 @@ using ShapePV = Shape<_128, _32, _64>;
 using SubgroupLayout = Layout<Shape<_8, _1, _1>>;
 ```
 
-**After** (doubled K-tile = 64, from `examples/06_bmg_flash_attention/06_bmg_prefill_attention.cpp`):
+**Actual codebase tile shapes** (from `examples/06_bmg_flash_attention/06_xe_fmha_fwd.cpp`):
+
+| Mode | HEAD_DIM | ShapeQK (M, N, K) | ShapePV (M, N, K) |
+|------|----------|-------------------|-------------------|
+| Prefill | 64 | `Shape<_128, _64, _32>` | `Shape<_128, _32, _64>` |
+| Prefill | 96 | `Shape<_128, _64, _32>` | `Shape<_128, _32, _64>` |
+| Prefill | 128 | `Shape<_256, _32, _32>` | `Shape<_256, _32, _32>` |
+| Prefill | 192 | `Shape<_256, _64, _32>` | `Shape<_256, _32, _64>` |
+| Decode | 64–192 | `Shape<_1, KV_TILE_SIZE, _64>` | `Shape<_1, _32, KV_TILE_SIZE>` |
+
+> **Note:** The decode configurations use `_64` for the head dimension (d), not as a K-tile in the
+> GEMM tiling sense. This cannot be cited as evidence that K=64 is better for prefill QK GEMMs.
+
+**Hypothetical tuning candidate** (K-tile = 64, not yet benchmarked — verify register pressure before using):
 
 ```cpp
 // HEAD_DIM = 64
@@ -134,13 +153,13 @@ using ShapeOutPut = Shape<_128, _128, _64>;
 using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
 ```
 
-**Why it helped:**  Each `XE_LOAD_2D_TRANSPOSE` / `XE_LOAD_2D_VNNI` 2D block load carries a fixed issue
-overhead.  With K-tile = 32, loads were issued frequently relative to the XMX work they fed.
-Doubling to K-tile = 64 halves the number of block loads per K-loop iteration, giving XMX more
-sustained work per memory transaction and improving bandwidth utilization.
+**Why this may help:**  Each `XE_LOAD_2D_TRANSPOSE` / `XE_LOAD_2D_VNNI` 2D block load carries a fixed issue
+overhead.  With K-tile = 32, loads are issued frequently relative to the XMX work they feed.
+Doubling to K-tile = 64 would halve the number of block loads per K-loop iteration, giving XMX more
+sustained work per memory transaction and potentially improving bandwidth utilization.
 
-**When to apply this pattern:**
-- The kernel is memory-bound (XMX utilization is low relative to bandwidth utilization).
+**Before trying this pattern:**
+- Confirm the kernel is memory-bound by profiling with Intel VTune or PTI.
 - The head dimension (or K extent) is large enough that the larger K-tile does not overflow the
   GRF budget (verify with [Intel VTune](https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler.html), [PTI for GPU](https://github.com/intel/pti-gpu), or `-v` compiler output; register spill negates the gain).
 - The K dimension of the problem is a multiple of the new tile size.
