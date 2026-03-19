@@ -103,47 +103,52 @@ Common tile sizes in this codebase:
 - Reduce M or N if register spill is observed (check with Intel VTune or compiler `-v` output).
 - Increase K-depth for memory-bound kernels to amortize the 2D block load overhead.
 
-#### Real-world example: Flash Attention BF16 tile-size tuning on Intel Xe BMG
+#### Exploratory example: Flash Attention BF16 tile-size tuning on Intel Xe BMG
 
-An improvement to the BF16 Flash Attention prefill kernel on Intel Arc BMG demonstrated that
-doubling the K-tile in the QK GEMM stage meaningfully improves performance by amortizing 2D block
-load overhead over more XMX compute.
+> ⚠️ **Not validated with benchmarks.** The tile-size suggestions below have not been confirmed
+> with measured profiling data. The optimal K-tile depends on head dimension, register pressure,
+> and GPU generation (Xe12/PVC vs Xe20/BMG). Always profile your specific workload before
+> committing to a tile-size change. Use the benchmark harness in `benchmarks/flash_attention/`
+> to validate any modifications.
 
-**Before** (conservative K-tile = 32):
+The general principle is that larger K-tiles *may* improve performance by amortizing 2D block
+load overhead over more XMX compute — but whether this actually helps in practice depends on
+your workload and hardware.
+
+The current configurations in `examples/06_bmg_flash_attention/06_xe_fmha_fwd.cpp` consistently
+use **K=32 for prefill** across all head dimensions:
+
+| Mode    | HEAD_DIM | ShapeQK (M, N, K)              | ShapePV (M, N, K)              |
+|---------|----------|-------------------------------|-------------------------------|
+| Prefill | 64       | `Shape<_128, _64, _32>`        | `Shape<_128, _32, _64>`        |
+| Prefill | 96       | `Shape<_128, _64, _32>`        | `Shape<_128, _32, _64>`        |
+| Prefill | 128      | `Shape<_256, _32, _32>`        | `Shape<_256, _32, _32>`        |
+| Prefill | 192      | `Shape<_256, _64, _32>`        | `Shape<_256, _32, _64>`        |
+| Decode  | 64–192   | `Shape<_1, KV_TILE_SIZE, _64>` | `Shape<_1, _32, KV_TILE_SIZE>` |
+
+> **Note:** The `_64` in the decode `ShapeQK` is the **head dimension** (d), not a K-tile in the
+> QK-GEMM sense used for prefill. Decode mode iterates over KV sequence positions, so its loop
+> structure differs from prefill and the two are not directly comparable.
+
+If profiling reveals that a prefill kernel is memory-bound (low XMX utilization, high bandwidth
+utilization), experimenting with a larger K-tile in the QK stage *may* help — for example:
 
 ```cpp
-// HEAD_DIM = 64 or 128
-using ShapeQK = Shape<_128, _64, _32>;      // K-tile is 32 elements wide
-using ShapePV = Shape<_128, _32, _64>;
-using SubgroupLayout = Layout<Shape<_8, _1, _1>>;
+// Exploratory: larger K-tile for prefill HEAD_DIM=64 (not the current default)
+// Current:      ShapeQK = Shape<_128, _64, _32>;
+// Experimental: ShapeQK = Shape<_128, _64, _64>;   // K-tile doubled — profile before adopting
 ```
 
-**After** (doubled K-tile = 64, from `examples/06_bmg_flash_attention/06_bmg_prefill_attention.cpp`):
+Each `XE_LOAD_2D_TRANSPOSE` / `XE_LOAD_2D_VNNI` 2D block load carries a fixed issue overhead.
+A larger K-tile halves the number of block loads per K-loop iteration, giving XMX more sustained
+work per memory transaction. However, whether this translates to a net gain depends on register
+pressure and the specific problem shape.
 
-```cpp
-// HEAD_DIM = 64
-using ShapeQK = Shape<_128, _64, _64>;      // K-tile doubled to 64 elements
-using ShapePV = Shape<_128, _32, _64>;
-using ShapeOutPut = Shape<_128, _64, _64>;
-using SubgroupLayout = Layout<Shape<_8, _1, _1>, Stride<_1, _1, _1>>;
-
-// HEAD_DIM = 128
-using ShapeQK = Shape<_128, _64, _64>;      // K-tile doubled to 64 elements
-using ShapePV = Shape<_128, _32, _64>;
-using ShapeOutPut = Shape<_128, _128, _64>;
-using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
-```
-
-**Why it helped:**  Each `XE_LOAD_2D_TRANSPOSE` / `XE_LOAD_2D_VNNI` 2D block load carries a fixed issue
-overhead.  With K-tile = 32, loads were issued frequently relative to the XMX work they fed.
-Doubling to K-tile = 64 halves the number of block loads per K-loop iteration, giving XMX more
-sustained work per memory transaction and improving bandwidth utilization.
-
-**When to apply this pattern:**
-- The kernel is memory-bound (XMX utilization is low relative to bandwidth utilization).
-- The head dimension (or K extent) is large enough that the larger K-tile does not overflow the
-  GRF budget (verify with Intel VTune or `-v` compiler output; register spill negates the gain).
-- The K dimension of the problem is a multiple of the new tile size.
+**Before trying this pattern:**
+- Confirm the kernel is memory-bound using Intel VTune "GPU Hotspot" analysis.
+- Verify the K dimension of the problem is a multiple of the new tile size.
+- Check register pressure with Intel VTune or `-v` compiler output; register spill negates any gain.
+- Run the benchmark harness before and after to confirm a real improvement on your target hardware.
 
 ### Pipeline stages
 
