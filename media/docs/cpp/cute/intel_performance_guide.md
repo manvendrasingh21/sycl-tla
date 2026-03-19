@@ -103,13 +103,20 @@ Common tile sizes in this codebase:
 - Reduce M or N if register spill is observed (check with Intel VTune or compiler `-v` output).
 - Increase K-depth for memory-bound kernels to amortize the 2D block load overhead.
 
-#### Real-world example: Flash Attention BF16 tile-size tuning on Intel Xe BMG
+#### Exploratory example: Flash Attention BF16 tile-size tuning on Intel Xe BMG
 
-An improvement to the BF16 Flash Attention prefill kernel on Intel Arc BMG demonstrated that
-doubling the K-tile in the QK GEMM stage meaningfully improves performance by amortizing 2D block
-load overhead over more XMX compute.
+> ⚠️ **Hypothetical guidance — not a validated benchmark result.**
+> The tile-size changes shown below are a suggested tuning direction based on general principles.
+> They have **not** been validated with measured benchmark data on production hardware.
+> Always profile with **Intel VTune** on your specific workload and target GPU before committing to
+> any tile-size changes.
 
-**Before** (conservative K-tile = 32):
+Doubling the K-tile in the QK GEMM stage of a BF16 Flash Attention prefill kernel on Intel Arc BMG
+**may improve performance** by amortizing 2D block load overhead over more XMX compute.
+The actual gain depends on your specific head dimension, register pressure, and GPU generation
+(Xe12/PVC vs. Xe20/BMG) — measure before adopting this change.
+
+**Before** (conservative K-tile = 32, matches the real prefill configurations in the codebase, e.g., `Shape<_256, _64, _32>`):
 
 ```cpp
 // HEAD_DIM = 64 or 128
@@ -118,7 +125,7 @@ using ShapePV = Shape<_128, _32, _64>;
 using SubgroupLayout = Layout<Shape<_8, _1, _1>>;
 ```
 
-**After** (doubled K-tile = 64, from `examples/06_bmg_flash_attention/06_bmg_prefill_attention.cpp`):
+**After** (doubled K-tile = 64 — a hypothetical tuning candidate; verify register pressure before using):
 
 ```cpp
 // HEAD_DIM = 64
@@ -134,10 +141,11 @@ using ShapeOutPut = Shape<_128, _128, _64>;
 using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
 ```
 
-**Why it helped:**  Each `XE_LOAD_2D_TRANSPOSE` / `XE_LOAD_2D_VNNI` 2D block load carries a fixed issue
-overhead.  With K-tile = 32, loads were issued frequently relative to the XMX work they fed.
-Doubling to K-tile = 64 halves the number of block loads per K-loop iteration, giving XMX more
-sustained work per memory transaction and improving bandwidth utilization.
+**Why this may help:**  Each `XE_LOAD_2D_TRANSPOSE` / `XE_LOAD_2D_VNNI` 2D block load carries a fixed issue
+overhead.  With K-tile = 32, loads are issued frequently relative to the XMX work they feed.
+Doubling to K-tile = 64 would halve the number of block loads per K-loop iteration, potentially
+giving XMX more sustained work per memory transaction and improving bandwidth utilization.
+**Profile with Intel VTune to confirm whether this holds for your workload.**
 
 **When to apply this pattern:**
 - The kernel is memory-bound (XMX utilization is low relative to bandwidth utilization).
