@@ -46,12 +46,13 @@ Many SYCL\*TLA GEMM kernels on Intel Xe use **direct Global→Register** 2D bloc
 bypassing SLM entirely.  This is valid when the tile size fits in the GRF budget and avoids the
 extra SLM round-trip.
 
-> **Note:** For CUTLASS-level automatic configuration (auto-selecting copy atoms, tile sizes, and
-dispatch policies), see `CollectiveBuilder` in
-> `examples/01_bmg_gemm_with_collective_builder/`. The rest of this guide focuses on
-> **CuTe-level manual tuning** for cases where `CollectiveBuilder` does not fit your needs.
+> **Two levels of tuning.** This guide covers both:
+> 1. **CuTe-level** — tile shapes, copy atoms, MMA atoms, subgroup sizing, SLM decisions, and prefetch strategy. Use when writing manual GEMM kernels (e.g., `examples/00_bmg_gemm/`).
+> 2. **CUTLASS-level** — `CollectiveBuilder` defaults, dispatch policies, and pipeline stages. Use when configuring via the collective API (e.g., `examples/01_bmg_gemm_with_collective_builder/`).
+>
+> Sections are labeled accordingly so you can skip what doesn't apply to your use case.
 
-## Optimization strategies
+## CuTe-level tuning
 
 ### Subgroup sizing
 
@@ -145,6 +146,12 @@ sustained work per memory transaction and improving bandwidth utilization.
   GRF budget (verify with [Intel VTune](https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler.html), [PTI for GPU](https://github.com/intel/pti-gpu), or `-v` compiler output; register spill negates the gain).
 - The K dimension of the problem is a multiple of the new tile size.
 
+## CUTLASS-level configuration
+
+The following knobs apply when using the `CollectiveBuilder` / `CollectiveMma` API
+rather than wiring CuTe atoms by hand.  For a working example, see
+[`examples/01_bmg_gemm_with_collective_builder/`](../../../../examples/01_bmg_gemm_with_collective_builder/).
+
 ### Pipeline stages
 
 For Flash Attention Prefill and many manual GEMM kernels, `PipelineStages = 2` is a common
@@ -158,6 +165,19 @@ static constexpr int PipelineStages = 2;  // one common value; CollectiveBuilder
 ```
 
 Increasing to 3 or 4 can help on high-latency HBM systems, but raises register pressure.
+
+### Dispatch policies
+
+Intel Xe dispatch policies tell the CUTLASS collective layer which hardware features
+to enable:
+
+| Policy | `SubgroupSize` | Mainloop | Use case |
+|--------|---------------|----------|----------|
+| `IntelXeXMX16` | 16 | `MainloopIntelXeXMX16` | Standard Xe GEMM with XMX acceleration |
+| `IntelXeGeneric` | 16 | `MainloopIntelXeGeneric` | Fallback without XMX (e.g., non-matrix workloads) |
+
+The `CollectiveBuilder` selects the dispatch policy automatically based on `cutlass::arch::IntelXe`
+and `OpClassTensorOp`.  Override by specifying the mainloop schedule explicitly.
 
 ## Common pitfalls
 
@@ -181,8 +201,8 @@ Increasing to 3 or 4 can help on high-latency HBM systems, but raises register p
    Consider a "residue" kernel or smaller tiles for non-multiple sizes.
 
 3. **Pipeline depth sufficient?**
-   The `CollectiveBuilder` defaults to `PipelineStages = 3` for standard GEMM; Flash Attention
-   Prefill uses `2`, and Decode uses `1`.  If memory latency is high and XMX utilization is low
+   See [Pipeline stages](#pipeline-stages) above for typical defaults.
+   If memory latency is high and XMX utilization is low
    in a GEMM or Prefill kernel, try increasing `PipelineStages` by one and re-benchmark — but
    verify register spill has not increased (use Intel VTune, [PTI for GPU](https://github.com/intel/pti-gpu),
    or compiler `-v` output), as each additional stage raises GRF pressure.  Decode kernels with
